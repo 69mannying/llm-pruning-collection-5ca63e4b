@@ -118,31 +118,31 @@ def get_wikitext_test(tokenizer):
 
 def get_calibration(tokenizer, nsamples, seqlen, seed):
     from datasets import load_dataset
+    random.seed(seed)
+    samples = []
     try:
-        data = load_dataset(
+        # STREAM c4 so we never materialize the 364M-example split (which the
+        # newer `datasets` would otherwise regenerate end-to-end).
+        stream = load_dataset(
             "allenai/c4", "en",
             data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-            split="train", verification_mode="no_checks")
-        texts = data
-        use_c4 = True
+            split="train", streaming=True)
+        buf = []
+        for ex in stream:
+            enc = tokenizer(ex["text"], return_tensors="pt")
+            if enc.input_ids.shape[1] > seqlen:
+                j = random.randint(0, enc.input_ids.shape[1] - seqlen - 1)
+                samples.append(enc.input_ids[:, j:j + seqlen])
+                if len(samples) >= nsamples:
+                    break
+        if samples:
+            print(f"[calib] streamed {len(samples)} c4 samples")
+            return samples
+        raise RuntimeError("c4 stream yielded no long-enough samples")
     except Exception as e:
         print(f"[calib] c4 unavailable ({e}); falling back to wikitext2 train")
         data = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split="train")
         enc = tokenizer(" ".join(data["text"]), return_tensors="pt")
-        use_c4 = False
-
-    random.seed(seed)
-    samples = []
-    if use_c4:
-        for _ in range(nsamples):
-            while True:
-                i = random.randint(0, len(texts) - 1)
-                enc = tokenizer(texts[i]["text"], return_tensors="pt")
-                if enc.input_ids.shape[1] > seqlen:
-                    break
-            j = random.randint(0, enc.input_ids.shape[1] - seqlen - 1)
-            samples.append(enc.input_ids[:, j:j + seqlen])
-    else:
         for _ in range(nsamples):
             j = random.randint(0, enc.input_ids.shape[1] - seqlen - 1)
             samples.append(enc.input_ids[:, j:j + seqlen])
