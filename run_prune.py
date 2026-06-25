@@ -104,9 +104,12 @@ def get_decoder_layers(model):
 # --------------------------------------------------------------------------- #
 # Data (wikitext2 ppl test set + c4 calibration), self-contained
 # --------------------------------------------------------------------------- #
+WIKITEXT_REPO = "Salesforce/wikitext"  # canonical mirror; bare "wikitext" fails on newer datasets
+
+
 def get_wikitext_test(tokenizer):
     from datasets import load_dataset
-    testdata = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    testdata = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split="test")
     return tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
 
 
@@ -121,7 +124,7 @@ def get_calibration(tokenizer, nsamples, seqlen, seed):
         use_c4 = True
     except Exception as e:
         print(f"[calib] c4 unavailable ({e}); falling back to wikitext2 train")
-        data = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        data = load_dataset(WIKITEXT_REPO, "wikitext-2-raw-v1", split="train")
         enc = tokenizer(" ".join(data["text"]), return_tensors="pt")
         use_c4 = False
 
