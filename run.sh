@@ -27,7 +27,10 @@ pip install --quiet --upgrade pip
 # available from torch >=2.6). Upgrade torch for the 5.x stack; leave the
 # preinstalled torch alone for the 4.x stack.
 case "${TF_VER}" in
-    5.*) echo "[install] upgrading torch for transformers 5.x"
+    5.*) echo "[install] upgrading torch for transformers 5.x; dropping stale torchvision/torchaudio"
+         # torchvision/torchaudio are pinned to the preinstalled torch and break
+         # when torch is upgraded; we only prune the text tower so they're unneeded.
+         pip uninstall -y torchvision torchaudio >/dev/null 2>&1 || true
          pip install --quiet --upgrade "torch>=2.6" ;;
 esac
 
