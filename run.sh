@@ -37,7 +37,7 @@ esac
 pip install --quiet \
     "transformers==${TF_VER}" \
     "datasets" "accelerate" \
-    "sentencepiece" "protobuf" "scikit-learn" "tqdm" "huggingface_hub"
+    "sentencepiece" "protobuf" "scikit-learn" "tqdm" "huggingface_hub" "wandb"
 
 # HF auth for gated models (token provided via env).
 if [ -n "${HF_TOKEN:-}" ]; then

@@ -54,6 +54,9 @@ NSAMPLES = int(cfg("NSAMPLES", "128"))
 SEQLEN = int(cfg("SEQLEN", "2048"))
 SAVE_MODEL = cfg("SAVE_MODEL", "0") == "1"
 SEED = int(cfg("SEED", "0"))
+# Optional: push the pruned checkpoint to the HF Hub (requires SAVE_MODEL=1).
+HF_UPLOAD_REPO = cfg("HF_UPLOAD_REPO", "")            # e.g. reneeice/gemma-4-31B-sparsegpt-unstructured-0.5
+USE_WANDB = cfg("USE_WANDB", "1") == "1"
 
 prune_n, prune_m = 0, 0
 if SPARSITY_TYPE != "unstructured":
@@ -308,6 +311,20 @@ def main():
     print(f"[config] MODEL={MODEL} METHOD={PRUNE_METHOD} TYPE={SPARSITY_TYPE} "
           f"RATIO={SPARSITY_RATIO} NSAMPLES={NSAMPLES} SEQLEN={SEQLEN}")
 
+    wb = None
+    if USE_WANDB and os.environ.get("WANDB_API_KEY"):
+        try:
+            import wandb
+            wb = wandb.init(
+                project="llm-pruning-granularity-2606.14150",
+                name=f"{MODEL.split('/')[-1]}-{PRUNE_METHOD}-{SPARSITY_TYPE}",
+                config={"model": MODEL, "method": PRUNE_METHOD,
+                        "sparsity_type": SPARSITY_TYPE, "ratio": SPARSITY_RATIO,
+                        "nsamples": NSAMPLES, "seqlen": SEQLEN})
+            print("[wandb] initialized")
+        except Exception as e:
+            print(f"[wandb] disabled ({e})")
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
@@ -365,7 +382,19 @@ def main():
         json.dump(result, f, indent=2)
     print("[artifact] result.json:", json.dumps(result))
 
-    # --- optional checkpoint product ---
+    if wb is not None:
+        try:
+            wb.log({"ppl_dense": result["ppl_dense"],
+                    "ppl_pruned": result["ppl_pruned"],
+                    "ppl_delta": result["ppl_delta"],
+                    "actual_sparsity": result["actual_sparsity"],
+                    "quality_retained_pct":
+                        100.0 * result["ppl_dense"] / result["ppl_pruned"]})
+            wb.summary.update(result)
+        except Exception as e:
+            print(f"[wandb] log failed ({e})")
+
+    # --- optional checkpoint product (+ HF Hub upload) ---
     if SAVE_MODEL:
         out_dir = os.path.join(REPO_ROOT, "pruned_checkpoint")
         model.save_pretrained(out_dir)
@@ -375,8 +404,59 @@ def main():
             f.write(json.dumps(result, indent=2))
         print(f"[product] pruned checkpoint -> {out_dir}")
 
+        if HF_UPLOAD_REPO:
+            try:
+                from huggingface_hub import HfApi
+                token = os.environ.get("HF_TOKEN")
+                api = HfApi(token=token)
+                api.create_repo(HF_UPLOAD_REPO, exist_ok=True, repo_type="model")
+                card = build_model_card(result, HF_UPLOAD_REPO)
+                with open(os.path.join(out_dir, "README.md"), "w") as f:
+                    f.write(card)
+                api.upload_folder(folder_path=out_dir, repo_id=HF_UPLOAD_REPO,
+                                  repo_type="model")
+                print(f"[product] uploaded to https://huggingface.co/{HF_UPLOAD_REPO}")
+                with open(os.path.join(ART_DIR, "hf_upload.txt"), "w") as f:
+                    f.write(f"https://huggingface.co/{HF_UPLOAD_REPO}\n")
+            except Exception as e:
+                print(f"[hf-upload] FAILED ({e})")
+
     # --- EVAL.md ---
     write_eval_md(result)
+    if wb is not None:
+        wb.finish()
+
+
+def build_model_card(r, repo):
+    label = f"{r['method']}-{r['sparsity_type']}"
+    return f"""---
+license: gemma
+base_model: {r['model']}
+tags:
+- pruning
+- wanda
+- sparsegpt
+- arxiv-2606.14150
+---
+
+# {repo.split('/')[-1]}
+
+One-shot **{label}** pruned (ratio {r['sparsity_ratio']}, actual {r['actual_sparsity']})
+version of `{r['model']}`, produced as part of a minimal reproduction of the
+granularity-ordering mechanism in arXiv 2606.14150
+(*Small LLMs: Pruning vs Training from Scratch*).
+
+| metric | value |
+|---|---|
+| dense wikitext-2 ppl | {r['ppl_dense']} |
+| pruned wikitext-2 ppl | {r['ppl_pruned']} |
+| Δ ppl | {r['ppl_delta']} |
+| calibration | {r['nsamples']} samples @ seqlen {r['seqlen']} |
+
+Note: unstructured / N:M sparsity zeroes weights **in place** — the parameter
+count and file size are unchanged; this is an initialization-quality probe, not
+a size-reduction. See the paper for the granularity/hardware trade-off.
+"""
 
 
 def write_eval_md(r):
