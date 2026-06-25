@@ -25,8 +25,8 @@ pip install --quiet --upgrade pip
 pip install --quiet \
     "torch" \
     "transformers==${TF_VER}" \
-    "datasets==2.16.0" "accelerate" \
-    "sentencepiece" "scikit-learn" "tqdm" "huggingface_hub"
+    "datasets" "accelerate" \
+    "sentencepiece" "protobuf" "scikit-learn" "tqdm" "huggingface_hub"
 
 # HF auth for gated models (token provided via env).
 if [ -n "${HF_TOKEN:-}" ]; then
