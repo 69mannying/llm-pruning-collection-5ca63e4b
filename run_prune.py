@@ -272,11 +272,39 @@ def prune_wanda(model, layers, samples, device, ratio, prune_n, prune_m):
 
 
 @torch.no_grad()
+def capture_per_layer_io(model, layers, samples, device):
+    """
+    One full-model forward per sample, hooking every decoder layer's *forward_pre*
+    to record (input_hidden_states, kwargs) for THAT layer specifically. This
+    captures each layer's own attention type / head_dim / position_embeddings /
+    KV-sharing — correct for heterogeneous architectures — while storing only the
+    cheap inputs (not Hessians). Returns per_layer[i] = list of (inp, kwargs).
+    """
+    store = {i: [] for i in range(len(layers))}
+    handles = []
+    for i, layer in enumerate(layers):
+        def pre_hook(idx):
+            def tmp(_, args, kwargs):
+                hs = args[0] if args else kwargs.get("hidden_states")
+                # keep inputs on CPU to fit all layers; kwargs (masks/pos-emb) stay
+                store[idx].append((hs.detach().cpu(),
+                                   {k: v for k, v in kwargs.items()}))
+            return tmp
+        handles.append(layer.register_forward_pre_hook(pre_hook(i), with_kwargs=True))
+    for s in samples:
+        model(s.to(device))
+    for h in handles:
+        h.remove()
+    return store
+
+
+@torch.no_grad()
 def prune_sparsegpt(model, layers, samples, device, ratio, prune_n, prune_m):
-    # SparseGPT Hessians are O(d_in^2) per linear and won't all fit at once for a
-    # 31B model. Process ONE decoder layer at a time: hook only that layer's
-    # linears, run the real full-model forward to gather its Hessian from real
-    # inputs (correct for heterogeneous attention), prune, free, then advance.
+    # Capture each layer's real inputs+kwargs in a single forward pass (cheap),
+    # then prune layer-by-layer: rebuild one layer's Hessians by replaying just
+    # that layer over its cached inputs. Memory-safe (one layer's Hessians live
+    # at a time) AND fast (one full forward total, not one per layer).
+    per_layer = capture_per_layer_io(model, layers, samples, device)
     for i, layer in enumerate(layers):
         subset = find_linear_layers(layer)
         gpts = {name: SparseGPT(lin) for name, lin in subset.items()}
@@ -289,8 +317,9 @@ def prune_sparsegpt(model, layers, samples, device, ratio, prune_n, prune_m):
                 return tmp
             handles.append(lin.register_forward_hook(hook(gpts[name])))
 
-        for s in samples:
-            model(s.to(device))
+        ldev = next(layer.parameters()).device
+        for inp, kwargs in per_layer[i]:
+            layer(inp.to(ldev), **kwargs)
         for h in handles:
             h.remove()
 
@@ -298,7 +327,7 @@ def prune_sparsegpt(model, layers, samples, device, ratio, prune_n, prune_m):
             gpts[name].fasterprune(ratio, prune_n=prune_n, prune_m=prune_m,
                                    percdamp=0.01, blocksize=128)
             gpts[name].free()
-        del gpts
+        del gpts, per_layer[i]
         torch.cuda.empty_cache()
         print(f"[sparsegpt] layer {i} done")
 
