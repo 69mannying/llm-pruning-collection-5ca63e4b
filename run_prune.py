@@ -210,6 +210,22 @@ def replay_layer(layer, inp, kwargs):
     return out[0] if isinstance(out, tuple) else out
 
 
+def set_use_cache(model, value):
+    """Set use_cache on whichever config actually carries it (top-level or
+    text_config for multimodal wrappers like Gemma-4). Returns the previous
+    value, or None if the attribute isn't present anywhere."""
+    cfg = model.config
+    target = cfg
+    if not hasattr(cfg, "use_cache") and hasattr(cfg, "text_config"):
+        target = cfg.text_config
+    prev = getattr(target, "use_cache", None)
+    try:
+        target.use_cache = value
+    except Exception:
+        pass
+    return prev
+
+
 # --------------------------------------------------------------------------- #
 # Pruning methods
 # --------------------------------------------------------------------------- #
@@ -341,8 +357,7 @@ def main():
         else:
             print("[calib] capturing calibration inputs")
             samples = get_calibration(tokenizer, NSAMPLES, seqlen, SEED)
-            use_cache = model.config.use_cache
-            model.config.use_cache = False
+            prev_uc = set_use_cache(model, False)
             inps, kwargs = capture_layer_inputs(model, layers, samples, device)
             print(f"[calib] captured {len(inps)} samples; "
                   f"layer kwargs: {list(kwargs.keys())}")
@@ -352,7 +367,8 @@ def main():
                 prune_sparsegpt(layers, inps, kwargs, SPARSITY_RATIO, prune_n, prune_m)
             else:
                 raise ValueError(f"unknown method {PRUNE_METHOD}")
-            model.config.use_cache = use_cache
+            if prev_uc is not None:
+                set_use_cache(model, prev_uc)
 
     actual_sparsity = check_sparsity(layers)
     print(f"[check] actual sparsity = {actual_sparsity:.4f}")
