@@ -1,0 +1,4 @@
+-e ./transformers
+composer==0.16.3
+llm-foundry==0.3.0
+fire
