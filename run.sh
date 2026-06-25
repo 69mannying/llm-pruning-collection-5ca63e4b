@@ -22,8 +22,16 @@ TF_VER="${TRANSFORMERS_VERSION:-4.55.0}"
 
 echo "[install] python deps (transformers==${TF_VER})"
 pip install --quiet --upgrade pip
+
+# transformers 5.x needs a recent torch (torch.distributed.tensor.device_mesh,
+# available from torch >=2.6). Upgrade torch for the 5.x stack; leave the
+# preinstalled torch alone for the 4.x stack.
+case "${TF_VER}" in
+    5.*) echo "[install] upgrading torch for transformers 5.x"
+         pip install --quiet --upgrade "torch>=2.6" ;;
+esac
+
 pip install --quiet \
-    "torch" \
     "transformers==${TF_VER}" \
     "datasets" "accelerate" \
     "sentencepiece" "protobuf" "scikit-learn" "tqdm" "huggingface_hub"
