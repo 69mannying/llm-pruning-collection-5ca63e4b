@@ -273,15 +273,33 @@ def prune_wanda(model, layers, samples, device, ratio, prune_n, prune_m):
 
 @torch.no_grad()
 def prune_sparsegpt(model, layers, samples, device, ratio, prune_n, prune_m):
-    collectors = collect_stats(model, layers, samples, device,
-                               lambda lin: SparseGPT(lin))
+    # SparseGPT Hessians are O(d_in^2) per linear and won't all fit at once for a
+    # 31B model. Process ONE decoder layer at a time: hook only that layer's
+    # linears, run the real full-model forward to gather its Hessian from real
+    # inputs (correct for heterogeneous attention), prune, free, then advance.
     for i, layer in enumerate(layers):
         subset = find_linear_layers(layer)
+        gpts = {name: SparseGPT(lin) for name, lin in subset.items()}
+
+        handles = []
+        for name, lin in subset.items():
+            def hook(o):
+                def tmp(_, inp, out):
+                    o.add_batch(inp[0].data, out.data)
+                return tmp
+            handles.append(lin.register_forward_hook(hook(gpts[name])))
+
+        for s in samples:
+            model(s.to(device))
+        for h in handles:
+            h.remove()
+
         for name in subset:
-            collectors[i][name].fasterprune(
-                ratio, prune_n=prune_n, prune_m=prune_m,
-                percdamp=0.01, blocksize=128)
-            collectors[i][name].free()
+            gpts[name].fasterprune(ratio, prune_n=prune_n, prune_m=prune_m,
+                                   percdamp=0.01, blocksize=128)
+            gpts[name].free()
+        del gpts
+        torch.cuda.empty_cache()
         print(f"[sparsegpt] layer {i} done")
 
 
