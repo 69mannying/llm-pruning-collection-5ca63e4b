@@ -34,10 +34,17 @@ case "${TF_VER}" in
          pip install --quiet --upgrade "torch>=2.6" ;;
 esac
 
+MODE="${MODE:-prune}"
+
 pip install --quiet \
     "transformers==${TF_VER}" \
     "datasets" "accelerate" \
     "sentencepiece" "protobuf" "scikit-learn" "tqdm" "huggingface_hub" "wandb"
+
+# Benchmark A (CPU sparse GEMM) also needs scipy + safetensors readers.
+if [ "${MODE}" = "bench_cpu" ]; then
+    pip install --quiet "scipy" "safetensors"
+fi
 
 # HF auth for gated models (token provided via env).
 if [ -n "${HF_TOKEN:-}" ]; then
@@ -46,8 +53,17 @@ if [ -n "${HF_TOKEN:-}" ]; then
         python3 -c "from huggingface_hub import login; import os; login(os.environ['HF_TOKEN'])"
 fi
 
-echo "[run] MODEL=${MODEL} METHOD=${PRUNE_METHOD} TYPE=${SPARSITY_TYPE} RATIO=${SPARSITY_RATIO} SEQLEN=${SEQLEN}"
-python3 "${REPO_ROOT}/run_prune.py"
+echo "[run] MODE=${MODE}"
+case "${MODE}" in
+    prune)
+        echo "[run] MODEL=${MODEL} METHOD=${PRUNE_METHOD} TYPE=${SPARSITY_TYPE} RATIO=${SPARSITY_RATIO} SEQLEN=${SEQLEN}"
+        python3 "${REPO_ROOT}/run_prune.py" ;;
+    bench_cpu)
+        python3 "${REPO_ROOT}/bench_cpu_sparse.py" ;;
+    bench_gpu)
+        python3 "${REPO_ROOT}/bench_gpu_24.py" ;;
+    *) echo "unknown MODE=${MODE}"; exit 1 ;;
+esac
 
 echo "[done] EVAL.md:"
 cat "${REPO_ROOT}/EVAL.md" || true
