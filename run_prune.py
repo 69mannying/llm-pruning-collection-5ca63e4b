@@ -172,44 +172,6 @@ def eval_ppl(model, tokenizer, seqlen, device):
 # Calibration capture (version-robust): grab the input + ALL kwargs the first
 # decoder layer receives, so we can replay every layer in isolation exactly.
 # --------------------------------------------------------------------------- #
-def capture_layer_inputs(model, layers, samples, device):
-    captured = {"inps": [], "kwargs": None}
-
-    class Catcher(nn.Module):
-        def __init__(self, mod):
-            super().__init__()
-            self.mod = mod
-
-        def forward(self, hidden_states, *args, **kwargs):
-            captured["inps"].append(hidden_states.detach())
-            if captured["kwargs"] is None:
-                # store everything except the hidden states; replayed verbatim
-                captured["kwargs"] = {k: v for k, v in kwargs.items()}
-            raise StopIteration
-
-        def __getattr__(self, name):
-            # Proxy any attribute the model-level forward expects on the layer
-            # (e.g. `attention_type` in modern transformers) to the wrapped module.
-            try:
-                return super().__getattr__(name)
-            except AttributeError:
-                return getattr(self.__dict__["_modules"]["mod"], name)
-
-    layers[0] = Catcher(layers[0])
-    for s in samples:
-        try:
-            model(s.to(device))
-        except StopIteration:
-            pass
-    layers[0] = layers[0].mod
-    return captured["inps"], (captured["kwargs"] or {})
-
-
-def replay_layer(layer, inp, kwargs):
-    out = layer(inp, **kwargs)
-    return out[0] if isinstance(out, tuple) else out
-
-
 def set_use_cache(model, value):
     """Set use_cache on whichever config actually carries it (top-level or
     text_config for multimodal wrappers like Gemma-4). Returns the previous
@@ -248,25 +210,50 @@ def prune_magnitude(layers, ratio, prune_n, prune_m):
 
 
 @torch.no_grad()
-def prune_wanda(layers, inps, kwargs, ratio, prune_n, prune_m):
+def collect_stats(model, layers, samples, device, make_collector):
+    """
+    Run full-model forwards over the calibration samples with a forward-hook on
+    every nn.Linear inside the decoder layers, accumulating per-layer statistics
+    via `make_collector(linear_module) -> obj` whose `.add_batch(inp, out)` is
+    called with that layer's real inputs/outputs.
+
+    Running the real forward (rather than replaying layers in isolation) makes
+    this correct for heterogeneous architectures — each layer naturally receives
+    its own attention type, head_dim, position_embeddings, KV-sharing, etc.
+    Returns {layer_idx: {linear_name: collector_obj}}.
+    """
+    collectors = {}
+    handles = []
+    for i, layer in enumerate(layers):
+        collectors[i] = {}
+        for name, lin in find_linear_layers(layer).items():
+            obj = make_collector(lin)
+            collectors[i][name] = obj
+
+            def hook(o):
+                def tmp(_, inp, out):
+                    o.add_batch(inp[0].data, out.data)
+                return tmp
+            handles.append(lin.register_forward_hook(hook(obj)))
+
+    for s in samples:
+        model(s.to(device))
+
+    for h in handles:
+        h.remove()
+    return collectors
+
+
+@torch.no_grad()
+def prune_wanda(model, layers, samples, device, ratio, prune_n, prune_m):
+    collectors = collect_stats(model, layers, samples, device,
+                               lambda lin: WrappedGPT(lin))
     for i, layer in enumerate(layers):
         subset = find_linear_layers(layer)
-        wrapped = {n: WrappedGPT(m) for n, m in subset.items()}
-
-        def hook(name):
-            def tmp(_, inp, out):
-                wrapped[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = [subset[n].register_forward_hook(hook(n)) for n in wrapped]
-        outs = [replay_layer(layer, inp, kwargs) for inp in inps]
-        for h in handles:
-            h.remove()
-
         for name, lin in subset.items():
             W = lin.weight.data
             metric = torch.abs(W) * torch.sqrt(
-                wrapped[name].scaler_row.reshape((1, -1)))
+                collectors[i][name].scaler_row.reshape((1, -1)).to(W.device))
             mask = torch.zeros_like(metric, dtype=torch.bool)
             if prune_n != 0:
                 for c in range(0, metric.shape[1], prune_m):
@@ -278,32 +265,20 @@ def prune_wanda(layers, inps, kwargs, ratio, prune_n, prune_m):
                 idx = sort_idx[:, :int(metric.shape[1] * ratio)]
                 mask.scatter_(1, idx, True)
             W[mask] = 0
-        inps = [replay_layer(layer, inp, kwargs) for inp in inps]
         print(f"[wanda] layer {i} done")
 
 
 @torch.no_grad()
-def prune_sparsegpt(layers, inps, kwargs, ratio, prune_n, prune_m):
+def prune_sparsegpt(model, layers, samples, device, ratio, prune_n, prune_m):
+    collectors = collect_stats(model, layers, samples, device,
+                               lambda lin: SparseGPT(lin))
     for i, layer in enumerate(layers):
         subset = find_linear_layers(layer)
-        gpts = {n: SparseGPT(m) for n, m in subset.items()}
-
-        def hook(name):
-            def tmp(_, inp, out):
-                gpts[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = [subset[n].register_forward_hook(hook(n)) for n in gpts]
-        for inp in inps:
-            replay_layer(layer, inp, kwargs)
-        for h in handles:
-            h.remove()
-
-        for name in gpts:
-            gpts[name].fasterprune(ratio, prune_n=prune_n, prune_m=prune_m,
-                                   percdamp=0.01, blocksize=128)
-            gpts[name].free()
-        inps = [replay_layer(layer, inp, kwargs) for inp in inps]
+        for name in subset:
+            collectors[i][name].fasterprune(
+                ratio, prune_n=prune_n, prune_m=prune_m,
+                percdamp=0.01, blocksize=128)
+            collectors[i][name].free()
         print(f"[sparsegpt] layer {i} done")
 
 
@@ -355,16 +330,15 @@ def main():
         if PRUNE_METHOD == "magnitude":
             prune_magnitude(layers, SPARSITY_RATIO, prune_n, prune_m)
         else:
-            print("[calib] capturing calibration inputs")
+            print("[calib] collecting calibration statistics via full-model forwards")
             samples = get_calibration(tokenizer, NSAMPLES, seqlen, SEED)
             prev_uc = set_use_cache(model, False)
-            inps, kwargs = capture_layer_inputs(model, layers, samples, device)
-            print(f"[calib] captured {len(inps)} samples; "
-                  f"layer kwargs: {list(kwargs.keys())}")
             if PRUNE_METHOD == "wanda":
-                prune_wanda(layers, inps, kwargs, SPARSITY_RATIO, prune_n, prune_m)
+                prune_wanda(model, layers, samples, device,
+                            SPARSITY_RATIO, prune_n, prune_m)
             elif PRUNE_METHOD == "sparsegpt":
-                prune_sparsegpt(layers, inps, kwargs, SPARSITY_RATIO, prune_n, prune_m)
+                prune_sparsegpt(model, layers, samples, device,
+                                SPARSITY_RATIO, prune_n, prune_m)
             else:
                 raise ValueError(f"unknown method {PRUNE_METHOD}")
             if prev_uc is not None:
