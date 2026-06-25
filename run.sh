@@ -15,7 +15,9 @@ REPO_ROOT="$(pwd)"
 mkdir -p "${REPO_ROOT}/.openresearch/artifacts"
 
 # shellcheck disable=SC1091
+set -a            # export every variable defined while sourcing the config
 source ./prune_config.env
+set +a
 TF_VER="${TRANSFORMERS_VERSION:-4.55.0}"
 
 echo "[install] python deps (transformers==${TF_VER})"

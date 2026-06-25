@@ -184,6 +184,14 @@ def capture_layer_inputs(model, layers, samples, device):
                 captured["kwargs"] = {k: v for k, v in kwargs.items()}
             raise StopIteration
 
+        def __getattr__(self, name):
+            # Proxy any attribute the model-level forward expects on the layer
+            # (e.g. `attention_type` in modern transformers) to the wrapped module.
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.__dict__["_modules"]["mod"], name)
+
     layers[0] = Catcher(layers[0])
     for s in samples:
         try:
